@@ -10,13 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "torch>=2.6",
-  "transformers>=4.57.0",
-  "trl>=0.23.0",
+  "transformers>=5.0.0",
   "peft>=0.17.0",
   "accelerate>=1.10.0",
-  "datasets>=3.6.0",
   "httpx>=0.28.0",
-  "pydantic>=2.11.0",
   "PyYAML>=6.0.2",
   "numpy>=2.1.0",
 ]

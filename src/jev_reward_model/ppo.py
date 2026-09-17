@@ -30,6 +30,12 @@ class ValueHead(nn.Module):
         return self.proj(hidden).squeeze(-1)
 
 
+def _text_backbone(model):
+    """Return Qwen3.5's language backbone, preserving PEFT wrappers when possible."""
+    base = model.base_model.model if hasattr(model, "base_model") else model
+    return base.model if hasattr(base, "model") else base
+
+
 def action_logprob(model, prompt_ids: torch.Tensor, generated_ids: torch.Tensor) -> torch.Tensor:
     full = torch.cat([prompt_ids, generated_ids], dim=1)
     attention = torch.ones_like(full)
@@ -41,13 +47,13 @@ def action_logprob(model, prompt_ids: torch.Tensor, generated_ids: torch.Tensor)
 
 
 def state_value(model, value_head: ValueHead, prompt_ids: torch.Tensor) -> torch.Tensor:
-    out = model(input_ids=prompt_ids, output_hidden_states=True)
+    out = _text_backbone(model)(input_ids=prompt_ids, output_hidden_states=True, return_dict=True)
     hidden = out.hidden_states[-1][:, -1, :].float()
     return value_head(hidden)
 
 
 def add_gae(rollout: list[PPORollout], gamma: float, lam: float) -> None:
-    """Compute GAE on one episode using stored rollout values."""
+    """Compute GAE on one complete episode using frozen rollout values."""
     gae = torch.zeros_like(rollout[0].old_value)
     next_value = torch.zeros_like(rollout[0].old_value)
     for item in reversed(rollout):
@@ -75,6 +81,5 @@ def ppo_loss(
 
     value = state_value(model, value_head, item.prompt_ids)
     value_loss = 0.5 * F.mse_loss(value, item.return_)
-
     entropy_bonus = new_logprob.new_zeros(())
     return policy_loss + value_coef * value_loss - entropy_coef * entropy_bonus
