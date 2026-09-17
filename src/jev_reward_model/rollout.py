@@ -1,68 +1,69 @@
+"""Synchronous on-policy batches; asynchronous judges run only after policy collection."""
 from __future__ import annotations
 
-import copy
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
 
 import torch
 
 from .env import WorkflowEnv, WorkflowTask
-
-SYSTEM = """You are an agent in a deterministic workflow environment.
-Emit exactly one action per turn.
-Use `DO <milestone text>` to perform a milestone.
-When all milestones are complete, emit the exact completion string.
-Obey all constraints for the full trajectory. Do not explain your action."""
+from .ppo import Turn
 
 
-@dataclass(slots=True)
-class Transition:
-    prompt_ids: torch.Tensor
-    action_ids: torch.Tensor
-    old_logprob: torch.Tensor
-    value: torch.Tensor
-    reward: float
-    done: bool
+@dataclass
+class Episode:
+    task: WorkflowTask
+    turns: list[Turn] = field(default_factory=list)
+    states: list[dict] = field(default_factory=list)
+    oracle: dict = field(default_factory=dict)
+    full_final: dict = field(default_factory=dict)
+    rewards: list[float] = field(default_factory=list)
+    potentials: list[float] = field(default_factory=list)
+    judge_success: float | None = None
+
+    def record(self, include_tokens: bool = False) -> dict:
+        result = {"task_id": self.task.task_id, "family": self.task.family, "split": self.task.split,
+                  "operations": len(self.task.milestones), "oracle": self.oracle,
+                  "public_final": self.full_final, "judge_final": self.states[-1], "rewards": self.rewards,
+                  "potentials": self.potentials, "judge_success": self.judge_success,
+                  "action_tokens": sum(t.action_ids.numel() for t in self.turns),
+                  "prompt_tokens": sum(t.prompt_ids.numel() for t in self.turns),
+                  "old_logprobs": [t.old_logprob for t in self.turns],
+                  "old_values": [t.old_value for t in self.turns],
+                  "ref_logprobs": [t.ref_logprob for t in self.turns]}
+        if include_tokens:
+            result["tokens"] = [{"prompt": t.prompt_ids.tolist(), "action": t.action_ids.tolist()}
+                                for t in self.turns]
+        return result
 
 
-def actor_messages(task: WorkflowTask, actions: list[str]) -> list[dict[str, str]]:
-    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": str(task.public_spec())}]
-    for action in actions:
-        messages.append({"role": "assistant", "content": action})
-        messages.append({"role": "user", "content": "Continue with exactly one next action."})
-    return messages
-
-
-def clone_state(state):
-    return copy.deepcopy(state)
-
-
-def generate_action(model, processor, task: WorkflowTask, actions: list[str], max_new_tokens: int) -> tuple[str, Any, Any]:
-    messages = actor_messages(task, actions)
-    inputs = processor.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
-    ).to(model.device)
-    with torch.no_grad():
-        output = model.generate(
-            **inputs, max_new_tokens=max_new_tokens, do_sample=True, temperature=1.0, top_p=0.95, top_k=20
-        )
-    generated = output[:, inputs["input_ids"].shape[-1]:]
-    text = processor.batch_decode(generated, skip_special_tokens=True)[0].strip().splitlines()[0]
-    return text, inputs, generated
-
-
-def run_episode(model, processor, task: WorkflowTask, reward_source, max_steps: int, max_new_tokens: int):
-    env = WorkflowEnv(task, max_steps=max_steps)
-    reward_source.reset(env.state)
-    records = []
-    for _ in range(max_steps):
-        action, inputs, generated = generate_action(model, processor, task, env.state.actions, max_new_tokens)
-        before = clone_state(env.state)
-        state, done = env.step(action)
-        reward = reward_source.transition(before, state)
-        if done:
-            reward += reward_source.terminal(state)
-        records.append({"inputs": inputs, "generated": generated, "action": action, "reward": reward, "done": done})
-        if done:
-            break
-    return records, env.state
+@torch.no_grad()
+def collect(actor, tasks: list[WorkflowTask], cfg, training: bool = True) -> list[Episode]:
+    actor.model.eval()
+    envs = [WorkflowEnv(t) for t in tasks]
+    episodes = [Episode(t, states=[env.state.public_state(cfg.judge_view, cfg.recent_events)])
+                for t, env in zip(tasks, envs)]
+    active = list(range(len(tasks)))
+    while active:
+        for start in range(0, len(active), cfg.generation_batch_size):
+            indices = active[start:start + cfg.generation_batch_size]
+            # Actor always gets full evidence; judge context ablations do not change the policy task.
+            prompts = [actor.prompt(envs[i].state.public_state()) for i in indices]
+            actions = actor.generate(prompts, greedy=not training)
+            for i, prompt, action in zip(indices, prompts, actions):
+                turn = Turn(prompt, action)
+                if training:
+                    lp, value = actor.score(prompt, action)
+                    turn.old_logprob, turn.old_value = lp.item(), value.item()
+                    if cfg.reference_kl_coef:
+                        ref, _ = actor.score(prompt, action, reference=True)
+                        turn.ref_logprob = ref.item()
+                    else:
+                        turn.ref_logprob = turn.old_logprob
+                envs[i].step(actor.decode(action))
+                episodes[i].turns.append(turn)
+                episodes[i].states.append(envs[i].state.public_state(cfg.judge_view, cfg.recent_events))
+        active = [i for i in active if not envs[i].state.done]
+    for episode, env in zip(episodes, envs):
+        episode.oracle = env.oracle()
+        episode.full_final = env.state.public_state()
+    return episodes

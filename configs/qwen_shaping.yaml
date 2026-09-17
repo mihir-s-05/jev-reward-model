@@ -1,6 +1,6 @@
 # All unspecified settings are shared defaults in ExperimentConfig.
-reward: jev_terminal
-output_dir: runs/jev_terminal/seed-0
+reward: qwen_shaping
+output_dir: runs/qwen_shaping/seed-0
 seed: 0
 model: Qwen/Qwen3.5-4B
 model_revision: main  # Prefer --model-revision <commit>; sweep resolves this once.

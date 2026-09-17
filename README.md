@@ -1,115 +1,177 @@
-# Jev as a Reward Model
+# Jev as a reward model
 
-Research harness for testing whether TypeSafe's **Jev** can act as a reusable reward source for PPO training of **Qwen3.5-4B**.
+An inspectable PPO experiment with **Qwen/Qwen3.5-4B** as the actor. The question is whether a frozen, task-conditioned evaluator provides rewards that improve **independently measured task success**, including on unseen dependency structures and longer trajectories.
 
-The experiment separates four conditions:
+**Implementation status:** reviewed code with 10 passing CPU tests. No Qwen GPU execution, live Jev/vLLM requests, or training results are claimed. Run the GPU preflight and judge audits before committing a training budget. [Review and remaining runtime checks](docs/review.md).
 
-1. **Grounded terminal reward + PPO** — simulator reward only.
-2. **Jev terminal reward + PPO** — Jev is the only terminal reward source.
-3. **Grounded reward + Jev potential shaping + PPO** — exact task reward plus dense Jev progress shaping.
-4. **Frozen Qwen judge + PPO** — a local general-purpose judge using the same base checkpoint as an alternative evaluator.
+## Comparisons
 
-All four use the same actor architecture, task distribution, PPO implementation, critic, seeds, and rollout budget. The exact simulator reward is always retained for evaluation, even when it is hidden from training.
+| Config | Training reward | Purpose |
+|---|---|---|
+| `grounded` | Exact terminal success | Oracle-reward PPO baseline |
+| `jev_terminal` | Jev's terminal success probability only | Can Jev replace the oracle reward? |
+| `jev_shaping` | Exact terminal success + Jev potential differences | Does frequent evaluation improve learning? |
+| `qwen_judge` | Frozen Qwen's terminal success estimate only | Alternative general evaluator |
+| `qwen_shaping` | Exact terminal success + frozen Qwen potential differences | Matched shaping control |
 
-## Task
+The fifth arm extends the original four-way comparison so evaluator identity and shaping can be separated. All use the same actor initialization, LoRA, policy-specific critic, PPO settings, task stream, and update budget for each seed. Qwen judging runs on a **separate frozen server**, never the changing actor. Its generated probabilities are not assumed calibrated.
 
-The environment is a deterministic long-horizon constraint-following workflow. Each episode gives the agent an ordered list of 3–5 milestones, persistent constraints, and an exact terminal completion string. The policy emits one textual action per turn. `DO <milestone>` performs a milestone. Milestones only count in order. Constraint violations are irreversible. A hidden simulator therefore gives us an exact success signal while Jev sees only the public task specification and action history.
+The default study is a controlled diagnostic, not evidence of a universal reward model. A fixed update budget is not a fixed token or dollar budget; the report aligns completed evaluations at common measured budgets.
 
-This task is intentionally controlled rather than realistic. It tests the core reward-model claim with minimal confounding: can a general evaluator recognize successful long-horizon behavior from trajectory context, and does optimizing that evaluator improve actual task success?
+## Task: dependency workflows
 
-## Jev integration
-
-The client follows TypeSafe's System One HTTP API:
+An agent receives a shuffled catalog of operations, prerequisites, permanent prohibitions, and an exact completion command. It emits one command per turn:
 
 ```text
-POST https://api.typesafe.ai/v1/systemone
-Authorization: Bearer <API_KEY>
+DO verify_invoice_<opaque-id>
+FINISH <episode-id>
 ```
 
-Requests contain `state`, `model: "jev-latest"`, and a map of typed questions. This repo uses a **noul** question for terminal success and a five-level **score** question for progress. The documented score is a probability-weighted level index, so the `[0, 4]` progress score is normalized to `[0, 1]`.
+The simulator applies, rejects, or ignores the action and returns a factual receipt. Finishing early, executing a forbidden command, or exhausting the budget without a correct finish fails. A rejected prerequisite attempt can be retried. Forbidden actions remain disqualifying even after subsequent valid work. No generated code is executed and no external systems are modified.
 
-```bash
-export TYPESAFE_API_KEY=...
-```
+Operation IDs are random, not topological indices. The actor must use the dependency graph rather than sort names. Stored topological order and computed success/progress/violation labels never enter evaluator requests. Actor and judge get the same public rules and authoritative event evidence, not the actor's self-reported accomplishments.
 
-Identical Jev requests are cached by SHA-256 under `.cache/jev/`. The client retries only TypeSafe's documented transient `429` and `529` responses with exponential backoff.
+| Split | Dependency families | Required operations |
+|---|---|---|
+| Train | Chain, fork/join, two chains | 4, 8, 12 |
+| Validation / in-distribution test | Same families, new instances | 4, 8, 12 |
+| Structural test | Barrier, overlapping dependencies | 4, 8, 12 |
+| Longer-horizon test | Training families, new instances | 20, 28 |
 
-## Install
+This tests temporal constraints and contextual evaluation without sandbox/verifier ambiguity. It does **not** test coding, open-world verification, multimodal reasoning, or hundreds of agent interactions. Check untrained performance first: a near-perfect baseline leaves no useful learning signal, while zero success may need a shared curriculum or warm-start in a subsequent, explicitly separate experiment.
+
+## Setup
+
+Use Python 3.11+ on a CUDA training machine. Install an appropriate PyTorch build for that machine before the training extras. The reviewed model integration pins Transformers 5.17.0 and PEFT 0.21.0; exact hardware compatibility is not established by CPU unit tests.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e '.[dev]'
-```
-
-Qwen3.5-4B is loaded from `Qwen/Qwen3.5-4B`. The policy uses LoRA adapters; the critic is a one-layer scalar value head over the actor's final prompt hidden state.
-
-## Generate one fixed dataset
-
-```bash
-python -m jev_reward_model.data \
-  --out data/tasks.jsonl \
-  --n-train 512 \
-  --n-eval 128 \
-  --seed 7
-```
-
-The final 128 tasks are reserved by the evaluation script. For a publication-quality follow-up, hold out whole task templates as well as random seeds.
-
-## Train
-
-```bash
-python -m jev_reward_model.train --config configs/grounded.yaml
-python -m jev_reward_model.train --config configs/jev_terminal.yaml
-python -m jev_reward_model.train --config configs/jev_shaping.yaml
-python -m jev_reward_model.train --config configs/qwen_judge.yaml
-```
-
-The implementation keeps PPO explicit so reward semantics remain inspectable:
-
-1. collect complete episodes;
-2. freeze rollout log-probabilities and critic values;
-3. compute generalized advantage estimates (GAE);
-4. normalize advantages across the rollout batch;
-5. apply the clipped PPO objective to the LoRA actor and MSE value loss to the learned critic.
-
-The critic is deliberately policy-specific. Jev supplies reward; it is **not** treated as the PPO value function.
-
-### Jev potential shaping
-
-The shaping condition uses
-
-```text
-r'_t = r_t + alpha * (gamma * Phi(s_{t+1}) - Phi(s_t))
-```
-
-where `Phi` is Jev's normalized progress score. Terminal potential is forced to zero. This tests dense contextual evaluation without repeatedly rewarding the policy merely for occupying a high-scoring partial state.
-
-## Evaluate
-
-```bash
-python -m jev_reward_model.evaluate --run-dir runs/grounded
-```
-
-Evaluation ignores the training reward and uses simulator truth. It records exact success, milestone progress, irreversible-violation rate, and complete action traces. The most informative failures are trajectories with high learned/Jev reward but simulator failure.
-
-## Recommended first experiment
-
-Run 3–5 seeds per condition and keep every parameter except reward source identical. Plot simulator success versus PPO update, simulator success versus evaluator cost, evaluator reward versus simulator success, and constraint-violation rate versus update.
-
-If Jev terminal reward rises together with grounded simulator success, that supports Jev as a reusable reward source. If Jev reward rises while simulator success plateaus or falls, the primary finding is reward overoptimization. The shaping condition tests whether frequent contextual judgments improve sample efficiency beyond terminal Jev evaluation.
-
-## Caveats
-
-- The environment is synthetic. Positive results justify moving to code/tool-use environments; they do not establish universal reward modeling.
-- The frozen-Qwen judge is an alternative evaluator baseline, not a perfectly cost-matched hosted-service comparison.
-- Jev and the actor see textual evidence. This measures semantic trajectory judging, not verification against external systems.
-- Any fixed judge can eventually be exploited. Evaluation must remain grounded in simulator truth.
-
-## Tests
-
-```bash
+pip install -e '.[train,dev,plots]'
 pytest -q
+python -m jev_reward_model.data --out-dir data --seed 7
+
+# Resolve ONCE and reuse this same commit for every actor and the frozen judge.
+export QWEN_REVISION="$(python -c 'from huggingface_hub import HfApi; print(HfApi().model_info("Qwen/Qwen3.5-4B").sha)')"
+python -m jev_reward_model.preflight --config configs/grounded.yaml \
+  --model-revision "$QWEN_REVISION"
 ```
 
-Tests intentionally cover only high-value invariants: ordered milestones, irreversible violations, and the potential-shaping equation. This is an experimentation repository, not production infrastructure.
+The preflight loads the real model, compares batched cached generation probabilities with the uncached PPO scoring path, and checks finite, nonzero actor/critic gradients. It makes no optimizer step or API call. Investigate a failure; do not simply relax its likelihood tolerance.
+
+For dataset creation and judge-only auditing, `pip install -e .` suffices: no training libraries or actor GPU are required. `.env.example` documents variables; files are **not automatically loaded**. Export credentials in your shell, never in YAML or committed code.
+
+### Jev
+
+```bash
+export TYPESAFE_API_KEY='your-key'
+python -m jev_reward_model.audit --backend jev \
+  --tasks data/validation.jsonl --limit 8 --output-dir audits/jev-preflight
+```
+
+This explicitly makes paid/API requests: six counterexample traces per task, with terminal and progress questions together. Inspect `scores.jsonl`, `summary.json`, and raw `judge_requests.jsonl` before training. The client follows the [TypeSafe HTTP API](https://docs.typesafe.ai/api), not an inferred SDK interface.
+
+### Frozen Qwen alternative
+
+Serve the **unmodified** same pinned checkpoint with a compatible vLLM installation in a separate environment/device or another host. Do not install a second serving stack into the pinned training environment without checking dependencies. Example server command after installing vLLM according to its documentation:
+
+```bash
+# Run on the judge machine/GPU; use the SAME exported checkpoint revision.
+vllm serve Qwen/Qwen3.5-4B --revision "$QWEN_REVISION" \
+  --served-model-name Qwen/Qwen3.5-4B --host 127.0.0.1 --port 8001 \
+  --dtype bfloat16 --max-model-len 8192
+```
+
+The client defaults to `http://localhost:8001/v1/chat/completions`. Change `qwen_judge_endpoint` for a remote deployment; use authentication/TLS rather than exposing an unauthenticated server publicly. `QWEN_JUDGE_API_KEY` is optional for an authenticated endpoint. Record the server package version and launch command with your experiment. The configured revision is provenance supplied by you, not a cryptographic check of server weights.
+
+```bash
+python -m jev_reward_model.audit --backend qwen \
+  --qwen-judge-revision "$QWEN_REVISION" \
+  --tasks data/validation.jsonl --limit 8 --output-dir audits/qwen-preflight
+```
+
+Both evaluators receive the same rubric. Qwen uses JSON-schema structured output with thinking disabled; malformed/truncated responses fail the experiment rather than produce invented rewards. A live server smoke test remains necessary. Do not assume actor and judge fit simultaneously on one GPU. Jev arms need only the actor device; the Qwen arms additionally need serving capacity.
+
+## Run the experiment
+
+First measure the untrained actor on validation, not the reserved test sets:
+
+```bash
+python -m jev_reward_model.evaluate --config configs/grounded.yaml \
+  --model-revision "$QWEN_REVISION" --tasks data/validation.jsonl \
+  --output-dir runs/base-validation
+```
+
+Train one arm and seed:
+
+```bash
+python -m jev_reward_model.train --config configs/jev_terminal.yaml \
+  --seed 0 --model-revision "$QWEN_REVISION" \
+  --qwen-judge-revision "$QWEN_REVISION" --output-dir runs/jev_terminal/seed-0
+```
+
+Or, after both evaluator preflights, launch all five arms across three seeds:
+
+```bash
+bash scripts/sweep.sh
+```
+
+That command starts **15 training runs** and makes evaluator requests; it is not a dry run. It rotates arm order across seeds to reduce simple time-order confounding. Stop/adjust the study based on validation diagnostics before spending the complete budget. Use the same changes across matched arms. Defaults are a starting protocol, not tuned or validated hyperparameters.
+
+Every run rejects a nonempty output directory. Configs are strict; typos and old scaffold keys fail. Data splits are independent files, explicitly tagged, and checked for overlap. Checkpoints save actor adapters, critic, optimizer, RNG states, dataset hashes, resolved config, and cumulative accounting. Evaluate a saved run with:
+
+```bash
+for split in test_id test_ood test_long; do
+  python -m jev_reward_model.evaluate --run-dir runs/jev_terminal/seed-0 \
+    --tasks "data/${split}.jsonl" \
+    --output-dir "runs/jev_terminal/seed-0/eval-${split}"
+done
+```
+
+Repeat for every arm/seed, using final or **validation-selected** checkpoints consistently. Do not choose checkpoints from test results. `--checkpoint PATH` overrides the latest checkpoint within a saved run. Independent evaluation uses only simulator truth and makes no judge calls.
+
+### Resume
+
+Resume a **trusted local** checkpoint into a **new** output directory. Use its saved resolved config, increasing `updates` to the desired total if necessary:
+
+```bash
+python -m jev_reward_model.train \
+  --config runs/jev_terminal/seed-0/resolved_config.yaml \
+  --resume runs/jev_terminal/seed-0/checkpoint-000050 \
+  --output-dir runs/jev_terminal/seed-0-resumed
+```
+
+Dataset hashes and all substantive settings must match. The cache is copied, RNG/optimizer state restored, and earlier costs carried forward. Old logs remain untouched; elapsed cost includes repeated validation after resuming. Use one run segment per seed in the report, not the original and its continuation as separate seeds. Loading optimizer checkpoints uses PyTorch's trusted serialization path: never load an untrusted checkpoint.
+
+## Audits and reporting
+
+Audit the **last** actual rollouts, not just synthetic cases or the easy initial policy:
+
+```bash
+python -m jev_reward_model.audit --backend jev \
+  --traces runs/jev_terminal/seed-0/train_traces.jsonl --last --limit 128 \
+  --views full recent ledger --output-dir audits/jev-late-policy
+
+python -m jev_reward_model.report runs/{grounded,jev_terminal,jev_shaping,qwen_judge,qwen_shaping}/seed-* \
+  --out-dir reports/comparison
+```
+
+The report writes checkpoint CSVs, reward-vs-ground-truth alignment, and success curves versus environment steps, action tokens, elapsed time, and (when supplied) estimated total dollars. It rejects mismatched nuisance configs/data. Budgets use only evaluations completed at or below that budget, never interpolated future results. Seed standard errors are descriptive, not significance tests.
+
+Set `actor_gpu_usd_per_hour` and `qwen_judge_gpu_usd_per_hour` in **all matched configs** to your actual reserved-device rates. Unknown prices remain unknown; local inference is not labeled free. Jev's default `$0.042/M input tokens` is a configurable launch-price assumption, **not a verified invoice**. Provider usage distinguishes billed requests from replay/cache usage; retries/errors may have unreported billing. Actor and local-judge device charges cover elapsed reserved time, including waits/evaluation, but not unrelated pre-study deployment time.
+
+`judge_view: full` is the primary experiment. `recent` intentionally removes older evidence; `ledger` retains every syntactic DO/FINISH attempt but drops inert narration. Actor context remains full in every condition. Offline view audits do not establish that training with that view improves performance; train separate matched studies to test that claim.
+
+## Implementation map
+
+| Module | Responsibility |
+|---|---|
+| `env.py`, `data.py` | Deterministic simulator, hidden labels, disjoint datasets |
+| `policy.py`, `preflight.py` | Actual Qwen loading, language-only LoRA, generation/likelihood/critic |
+| `ppo.py`, `rollout.py` | Complete episodes, GAE, command-level clipped PPO, gradient accumulation |
+| `judge.py`, `jev.py`, `rewards.py` | Shared rubric, validated HTTP/cache/audit, five reward conditions |
+| `train.py`, `evaluate.py` | Training/checkpoints and independent evaluation |
+| `audit.py`, `report.py` | Counterexamples, calibration, context ablations, common-budget comparison |
+| `config.py`, `utils.py` | Strict settings, JSON, fingerprints, provenance |
+
+See [design and interpretation](docs/design.md) for the objective, invariants, artifacts, and limitations. Version 2 replaces the earlier scaffold; its old datasets/configs/checkpoints are not compatible. This is intentionally a small single-actor-device research harness, not distributed production RL infrastructure.

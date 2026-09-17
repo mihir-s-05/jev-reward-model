@@ -1,3 +1,3 @@
-"""Jev reward-model research harness."""
+"""Controlled, grounded comparisons of Jev reward evaluation for Qwen PPO."""
 
-__all__ = ["config", "env", "jev", "rewards"]
+__version__ = "0.2.0"

@@ -1,75 +1,41 @@
+"""Reward assignment is the only experimental difference between arms."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
+from pathlib import Path
 
-from .env import WorkflowState
-from .jev import JevClient
+from .config import ExperimentConfig
 
 
-class RewardSource(Protocol):
-    def reset(self, state: WorkflowState) -> None: ...
-    def transition(self, before: WorkflowState, after: WorkflowState) -> float: ...
-    def terminal(self, state: WorkflowState) -> float: ...
+def make_judge(cfg: ExperimentConfig, run_dir: Path):
+    if cfg.reward.startswith("jev_"):
+        from .jev import JevClient
+        return JevClient(cfg, run_dir)
+    if cfg.reward.startswith("qwen_"):
+        from .judge import QwenJudge
+        return QwenJudge(cfg, run_dir)
+    return None
 
 
-@dataclass
-class GroundedReward:
-    def reset(self, state: WorkflowState) -> None:
-        pass
-
-    def transition(self, before: WorkflowState, after: WorkflowState) -> float:
-        return 0.0
-
-    def terminal(self, state: WorkflowState) -> float:
-        return 1.0 if state.success else 0.0
+def potential_rewards(base: list[float], phi: list[float], gamma: float, alpha: float) -> list[float]:
+    if len(phi) != len(base) + 1 or phi[-1] != 0:
+        raise ValueError("Complete episodes require one potential per boundary and terminal Phi=0")
+    return [r + alpha * (gamma * phi[t + 1] - phi[t]) for t, r in enumerate(base)]
 
 
-class JevTerminalReward:
-    def __init__(self, client: JevClient):
-        self.client = client
-
-    def reset(self, state: WorkflowState) -> None:
-        pass
-
-    def transition(self, before: WorkflowState, after: WorkflowState) -> float:
-        return 0.0
-
-    def terminal(self, state: WorkflowState) -> float:
-        return self.client.terminal_success(state.public_state())
-
-
-class JevPotentialShapingReward:
-    """Grounded terminal reward plus gamma-consistent Jev potential shaping."""
-
-    def __init__(self, client: JevClient, gamma: float, alpha: float):
-        self.client, self.gamma, self.alpha = client, gamma, alpha
-        self._phi = 0.0
-
-    def reset(self, state: WorkflowState) -> None:
-        self._phi = self.client.progress(state.public_state())
-
-    def transition(self, before: WorkflowState, after: WorkflowState) -> float:
-        next_phi = 0.0 if after.done else self.client.progress(after.public_state())
-        shaped = self.alpha * (self.gamma * next_phi - self._phi)
-        self._phi = next_phi
-        return shaped
-
-    def terminal(self, state: WorkflowState) -> float:
-        return 1.0 if state.success else 0.0
-
-
-class QwenJudgeReward:
-    """Local alternative-judge baseline. The callable returns P(success|trajectory)."""
-
-    def __init__(self, judge_fn):
-        self.judge_fn = judge_fn
-
-    def reset(self, state: WorkflowState) -> None:
-        pass
-
-    def transition(self, before: WorkflowState, after: WorkflowState) -> float:
-        return 0.0
-
-    def terminal(self, state: WorkflowState) -> float:
-        return float(self.judge_fn(state.public_state()))
+def assign_rewards(episodes: list, cfg: ExperimentConfig, judge) -> None:
+    """Judges receive only saved PUBLIC prefixes, never the oracle dictionary."""
+    if cfg.reward in {"jev_terminal", "qwen_judge"}:
+        answers = judge.evaluate_many([e.states[-1] for e in episodes], "terminal")
+        for episode, answer in zip(episodes, answers):
+            episode.judge_success = answer["success"]
+            episode.rewards = [0.0] * (len(episode.turns) - 1) + [answer["success"]]
+    else:
+        for episode in episodes:
+            episode.rewards = [0.0] * (len(episode.turns) - 1) + [episode.oracle["success"]]
+        if cfg.reward in {"jev_shaping", "qwen_shaping"}:
+            prefixes = [s for e in episodes for s in e.states[:-1]]
+            answers = iter(judge.evaluate_many(prefixes, "progress"))
+            for episode in episodes:
+                episode.potentials = [next(answers)["progress"] for _ in episode.turns] + [0.0]
+                episode.rewards = potential_rewards(episode.rewards, episode.potentials,
+                                                     cfg.gamma, cfg.shaping_alpha)

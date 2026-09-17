@@ -1,88 +1,129 @@
+"""A finite-horizon dependency workflow with separate public evidence and oracle state.
+
+Commands never execute code or touch external systems. Every operation and constraint
+is specified publicly; only the deterministic success/progress labels stay private.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+
+ENV_VERSION = "workflow-dag-v2"
+RULES = (
+    "Emit exactly one line per turn, with no explanation. DO <operation> applies a named "
+    "operation only after all its prerequisites have been applied. A premature or repeated "
+    "operation is rejected, consumes a turn, and can be retried; rejection alone is not a "
+    "constraint violation. Executing an exact forbidden action invalidates the entire episode "
+    "irreversibly. Unknown or multiline actions are inert and consume a turn. Finish with the "
+    "exact completion action after every required operation. Finishing early or exhausting "
+    "the turn budget without that completion action is failure. Claims are not operations."
+)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class WorkflowTask:
     task_id: str
+    split: str
+    family: str
     goal: str
     milestones: tuple[str, ...]
+    prerequisites: tuple[tuple[str, ...], ...]
     forbidden: tuple[str, ...]
     required_final: str
+    max_steps: int
+    display_order: tuple[int, ...]
+    version: str = ENV_VERSION
 
-    def public_spec(self) -> dict[str, Any]:
-        return {
-            "goal": self.goal,
-            "milestones": list(self.milestones),
-            "constraints": [f"Do not {x}." for x in self.forbidden],
-            "completion_rule": f"Finish by emitting: {self.required_final}",
-        }
+    def __post_init__(self) -> None:
+        n = len(self.milestones)
+        if self.version != ENV_VERSION or n < 1 or len(set(self.milestones)) != n:
+            raise ValueError("Invalid task version or operation names")
+        if len(self.prerequisites) != n or sorted(self.display_order) != list(range(n)):
+            raise ValueError("Invalid dependency/display structure")
+        for i, parents in enumerate(self.prerequisites):
+            if not set(parents) <= set(self.milestones[:i]):
+                raise ValueError("Task storage order must be topological")
+        if self.max_steps < n + 1:
+            raise ValueError("Budget cannot accommodate a successful trajectory")
+        if set(self.forbidden) & {"DO " + m for m in self.milestones}:
+            raise ValueError("Required operation cannot be forbidden")
+        if self.required_final in self.forbidden:
+            raise ValueError("Completion cannot be forbidden")
+
+    def public_spec(self) -> dict:
+        return {"goal": self.goal, "rules": RULES,
+                "operations": [{"name": self.milestones[i], "requires": self.prerequisites[i]}
+                               for i in self.display_order],
+                "forbidden_actions": self.forbidden, "completion_action": self.required_final,
+                "turn_budget": self.max_steps}
 
 
-@dataclass(slots=True)
+@dataclass
 class WorkflowState:
     task: WorkflowTask
-    completed: set[int] = field(default_factory=set)
+    completed: set[str] = field(default_factory=set)
     violations: list[str] = field(default_factory=list)
-    actions: list[str] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)
     done: bool = False
+    finished: bool = False
 
     @property
     def success(self) -> bool:
-        return self.done and len(self.completed) == len(self.task.milestones) and not self.violations
+        # Budget exhaustion is terminal but is never an implicit FINISH.
+        return self.finished and len(self.completed) == len(self.task.milestones) and not self.violations
 
     @property
     def progress(self) -> float:
-        if not self.task.milestones:
-            return 1.0
         return len(self.completed) / len(self.task.milestones)
 
-    def public_state(self) -> dict[str, Any]:
-        # Do not expose parser state such as completed indices or exact success.
-        return {"task": self.task.public_spec(), "actions_so_far": self.actions}
+    def public_state(self, view: str = "full", recent: int = 4) -> dict:
+        events = self.events
+        if view == "recent":
+            events = events[-recent:]
+        elif view == "ledger":
+            # Preserve all actual DO/FINISH attempts, including forbidden and rejected actions.
+            # This is syntactic evidence compression, NOT oracle progress/violation labels.
+            events = [e for e in events if e["action"].startswith(("DO ", "FINISH "))]
+        elif view != "full":
+            raise ValueError(view)
+        return {"task": self.task.public_spec(), "events": [dict(e) for e in events],
+                "ended": self.done, "turns_used": len(self.events),
+                "turns_remaining": self.task.max_steps - len(self.events),
+                "history_view": view, "omitted_events": len(self.events) - len(events)}
 
 
 class WorkflowEnv:
-    """Small deterministic environment with irreversible constraint violations.
+    def __init__(self, task: WorkflowTask):
+        self.state = WorkflowState(task)
+        self.requirements = dict(zip(task.milestones, task.prerequisites))
 
-    Actor actions are intentionally textual. A valid milestone action is
-    `DO <exact milestone text>`. The terminal action is the task's required
-    final string. Anything else is allowed but makes no simulator progress.
-    """
+    def step(self, raw_action: str) -> dict:
+        s = self.state
+        if s.done:
+            raise RuntimeError("Episode already ended")
+        action = raw_action.strip()
+        receipt = "inert"
+        if "\n" not in action and "\r" not in action:
+            if action == s.task.required_final:
+                s.done = s.finished = True
+                receipt = "finished"
+            elif action in s.task.forbidden:
+                s.violations.append(action)
+                receipt = "applied"  # Do not hand the evaluator a 'violation' label.
+            elif action.startswith("DO ") and action[3:] in self.requirements:
+                name = action[3:]
+                if name not in s.completed and set(self.requirements[name]) <= s.completed:
+                    s.completed.add(name)
+                    receipt = "applied"
+                else:
+                    receipt = "rejected"
+        event = {"turn": len(s.events) + 1, "action": action, "receipt": receipt}
+        s.events.append(event)
+        if len(s.events) == s.task.max_steps:
+            s.done = True  # The horizon is part of the task, not a collector truncation.
+        return event
 
-    def __init__(self, task: WorkflowTask, max_steps: int = 8):
-        self.state = WorkflowState(task=task)
-        self.max_steps = max_steps
-
-    def step(self, action: str) -> tuple[WorkflowState, bool]:
-        if self.state.done:
-            raise RuntimeError("episode already finished")
-
-        action = action.strip()
-        self.state.actions.append(action)
-        lowered = action.lower()
-
-        for forbidden in self.state.task.forbidden:
-            if forbidden.lower() in lowered and forbidden not in self.state.violations:
-                self.state.violations.append(forbidden)
-
-        if action == self.state.task.required_final:
-            self.state.done = True
-        elif action.startswith("DO "):
-            payload = action[3:].strip()
-            for i, milestone in enumerate(self.state.task.milestones):
-                if payload == milestone:
-                    # Enforce order to create delayed dependencies.
-                    if i == 0 or (i - 1) in self.state.completed:
-                        self.state.completed.add(i)
-                    break
-
-        if len(self.state.actions) >= self.max_steps:
-            self.state.done = True
-
-        return self.state, self.state.done
-
-    def grounded_terminal_reward(self) -> float:
-        return 1.0 if self.state.success else 0.0
+    def oracle(self) -> dict:
+        s = self.state
+        return {"success": float(s.success), "progress": s.progress,
+                "violation": float(bool(s.violations)), "finished": s.finished,
+                "steps": len(s.events), "terminal_reason": "finish" if s.finished else "budget"}

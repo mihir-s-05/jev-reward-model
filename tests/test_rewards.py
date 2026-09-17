@@ -1,18 +1,26 @@
-from jev_reward_model.rewards import JevPotentialShapingReward
+from types import SimpleNamespace
+
+import pytest
+
+from jev_reward_model.config import ExperimentConfig
+from jev_reward_model.rewards import assign_rewards, potential_rewards
 
 
-class FakeJev:
-    def __init__(self): self.values = iter([0.25, 0.5])
-    def progress(self, _): return next(self.values)
+def test_discounted_shaping_telescopes():
+    gamma, alpha = 0.91, 0.5
+    base, phi = [0, 0, 1], [0.2, 0.7, 0.5, 0.0]
+    shaped = potential_rewards(base, phi, gamma, alpha)
+    difference = sum(gamma ** t * (s - b) for t, (s, b) in enumerate(zip(shaped, base)))
+    assert difference == pytest.approx(-alpha * phi[0])
+    with pytest.raises(ValueError):
+        potential_rewards(base, [0, 0, 0, 1], gamma, alpha)
 
 
-class State:
-    done = False
-    def public_state(self): return {}
-
-
-def test_potential_shaping_formula():
-    reward = JevPotentialShapingReward(FakeJev(), gamma=0.9, alpha=2.0)
-    s = State(); reward.reset(s)
-    got = reward.transition(s, s)
-    assert abs(got - 2.0 * (0.9 * 0.5 - 0.25)) < 1e-9
+def test_terminal_arm_cannot_fall_back_to_oracle():
+    class Judge:
+        def evaluate_many(self, states, kind):
+            assert states == [{"public": "evidence"}]
+            return [{"success": 0.2}]
+    episode = SimpleNamespace(states=[{}, {"public": "evidence"}], turns=[None], oracle={"success": 1.0})
+    assign_rewards([episode], ExperimentConfig(reward="jev_terminal"), Judge())
+    assert episode.rewards == [0.2]

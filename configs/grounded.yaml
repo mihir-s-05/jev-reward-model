@@ -1,19 +1,19 @@
-name: grounded
-seed: 7
-model: Qwen/Qwen3.5-4B
-train_data: data/tasks.jsonl
+# All unspecified settings are shared defaults in ExperimentConfig.
 reward: grounded
-output_dir: runs/grounded
-steps: 200
-rollouts_per_step: 8
-max_episode_steps: 8
-max_new_tokens: 64
-learning_rate: 1.0e-5
-ppo_epochs: 2
-gamma: 0.99
+output_dir: runs/grounded/seed-0
+seed: 0
+model: Qwen/Qwen3.5-4B
+model_revision: main  # Prefer --model-revision <commit>; sweep resolves this once.
+train_data: data/train.jsonl
+eval_data: data/validation.jsonl
+updates: 100
+rollouts_per_update: 8
+generation_batch_size: 2
+max_new_tokens: 48
+gamma: 1.0
 gae_lambda: 0.95
-clip_range: 0.2
-value_coef: 0.5
-entropy_coef: 0.0
-lora_r: 16
-lora_alpha: 32
+shaping_alpha: 0.5
+judge_view: full
+qwen_judge_revision: UNPINNED  # Set to your frozen server's exact checkpoint revision.
+actor_gpu_usd_per_hour: null  # Required for dollar-comparison plots.
+qwen_judge_gpu_usd_per_hour: null
