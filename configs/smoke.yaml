@@ -1,0 +1,16 @@
+# A GPU/API integration check, NOT evidence of learning or a cheap CPU run.
+task:
+  train_orders: [1, 1]
+  long_orders: [2, 2]
+  extra_steps: 2
+model:
+  max_context: 8192
+  max_new_tokens: 96
+ppo:
+  updates: 2
+  episodes_per_update: 2
+  epochs: 1
+  minibatch_turns: 4
+  eval_every: 1
+  eval_episodes: 2
+  checkpoint_every: 1
