@@ -6,26 +6,37 @@ import torch
 
 
 class LocalQwenJudge:
-    """Binary terminal judge using the same Qwen checkpoint without sharing policy state.
-
-    For a clean experiment, instantiate this from the frozen base checkpoint, not the
-    PPO-updated policy adapter. It asks for a single YES/NO token and converts the
-    next-token logits into P(YES).
-    """
+    """Frozen binary terminal judge using the same Qwen3.5-4B base checkpoint."""
 
     def __init__(self, model, processor):
-        self.model, self.processor = model, processor
-        tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        self.yes_id = tok.encode("YES", add_special_tokens=False)[0]
-        self.no_id = tok.encode("NO", add_special_tokens=False)[0]
+        self.model = model
+        self.processor = processor
+        tokenizer = processor.tokenizer
+        yes = tokenizer.encode("YES", add_special_tokens=False)
+        no = tokenizer.encode("NO", add_special_tokens=False)
+        if len(yes) != 1 or len(no) != 1:
+            raise RuntimeError("YES/NO must each be one token for the logit judge baseline")
+        self.yes_id, self.no_id = yes[0], no[0]
 
     @torch.no_grad()
     def __call__(self, public_state: dict) -> float:
-        prompt = (
-            "Judge whether this workflow is fully successful. It is successful only if every milestone was "
-            "completed in order, the exact completion string was emitted, and no constraint was violated. "
-            "Answer YES or NO only.\n\n" + json.dumps(public_state, sort_keys=True)
-        )
-        inputs = self.processor(text=prompt, return_tensors="pt").to(self.model.device)
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "Judge whether this workflow is fully successful. It is successful only if every milestone "
+                    "was completed in order, the exact completion string was emitted, and no constraint was "
+                    "violated. Answer YES or NO only.\n\n" + json.dumps(public_state, sort_keys=True)
+                ),
+            }
+        ]
+        inputs = self.processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=False,
+        ).to(self.model.device)
         logits = self.model(**inputs).logits[0, -1, [self.no_id, self.yes_id]].float()
         return float(torch.softmax(logits, dim=-1)[1].item())

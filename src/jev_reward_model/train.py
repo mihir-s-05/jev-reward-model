@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModelForMultimodalLM, AutoProcessor
 
 from .config import ExperimentConfig
 from .data import load
@@ -27,7 +27,7 @@ def seed_all(seed: int) -> None:
 
 def load_policy(cfg: ExperimentConfig):
     processor = AutoProcessor.from_pretrained(cfg.model)
-    base = AutoModelForCausalLM.from_pretrained(
+    base = AutoModelForMultimodalLM.from_pretrained(
         cfg.model, torch_dtype=torch.bfloat16, device_map="auto"
     )
     lora = LoraConfig(
@@ -37,7 +37,8 @@ def load_policy(cfg: ExperimentConfig):
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(base, lora)
-    value_head = ValueHead(model.config.hidden_size).to(model.device)
+    hidden_size = model.config.text_config.hidden_size
+    value_head = ValueHead(hidden_size).to(model.device)
     return model, value_head, processor
 
 
@@ -97,7 +98,7 @@ def main() -> None:
 
     frozen_judge = None
     if cfg.reward == "qwen_judge":
-        judge_model = AutoModelForCausalLM.from_pretrained(
+        judge_model = AutoModelForMultimodalLM.from_pretrained(
             cfg.model, torch_dtype=torch.bfloat16, device_map="auto"
         )
         frozen_judge = LocalQwenJudge(judge_model, processor)
