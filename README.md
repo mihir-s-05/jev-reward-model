@@ -2,7 +2,7 @@
 
 An inspectable PPO experiment with **Qwen/Qwen3.5-4B** as the actor. The question is whether a frozen, task-conditioned evaluator provides rewards that improve **independently measured task success**, including on unseen dependency structures and longer trajectories.
 
-**Implementation status:** reviewed code with 10 passing CPU tests. No Qwen GPU execution, live Jev/vLLM requests, or training results are claimed. Run the GPU preflight and judge audits before committing a training budget. [Review and remaining runtime checks](docs/review.md).
+**Implementation status:** reviewed code with CPU unit tests covering the actor device path, PPO, simulator, and mocked judges. No full Qwen 4B training results, live Jev/vLLM requests, or hardware throughput numbers are claimed. Run actor preflight and judge audits on the target machine before committing a training budget. [Review and remaining runtime checks](docs/review.md).
 
 ## Comparisons
 
@@ -42,7 +42,7 @@ This tests temporal constraints and contextual evaluation without sandbox/verifi
 
 ## Setup
 
-Use Python 3.11+ on a CUDA training machine. Install an appropriate PyTorch build for that machine before the training extras. The reviewed model integration pins Transformers 5.17.0 and PEFT 0.21.0; exact hardware compatibility is not established by CPU unit tests.
+Use Python 3.11+. CUDA is the default actor device (`device: cuda:0`, `dtype: bfloat16`). CPU is a first-class alternative for the **full** train/eval path (`device: cpu`, `dtype: float32`) — not a smoke-only mode. Install an appropriate PyTorch build for the machine (CUDA or CPU) before the training extras. The reviewed model integration pins Transformers 5.17.0 and PEFT 0.21.0.
 
 ```bash
 python -m venv .venv
@@ -57,9 +57,28 @@ python -m jev_reward_model.preflight --config configs/grounded.yaml \
   --model-revision "$QWEN_REVISION"
 ```
 
-The preflight loads the real model, compares batched cached generation probabilities with the uncached PPO scoring path, and checks finite, nonzero actor/critic gradients. It makes no optimizer step or API call. Investigate a failure; do not simply relax its likelihood tolerance.
+The preflight loads the real model on the configured device, compares batched cached generation probabilities with the uncached PPO scoring path, and checks finite, nonzero actor/critic gradients. It makes no optimizer step or API call. Investigate a failure; do not simply relax its likelihood tolerance.
 
 For dataset creation and judge-only auditing, `pip install -e .` suffices: no training libraries or actor GPU are required. `.env.example` documents variables; files are **not automatically loaded**. Export credentials in your shell, never in YAML or committed code.
+
+### CPU actor (full pipeline)
+
+CPU runs use the same modules as CUDA: preflight, rollouts, command-level PPO, evaluation, checkpointing, and resume. They are much slower (4B float32 generation and backward on CPU). Do not stub out PPO or skip rollouts; reduce `updates` / `eval_tasks` only if you are debugging, not for a matched study.
+
+```bash
+python -m jev_reward_model.preflight --config configs/grounded_cpu.yaml \
+  --model-revision "$QWEN_REVISION"
+python -m jev_reward_model.evaluate --config configs/grounded_cpu.yaml \
+  --model-revision "$QWEN_REVISION" --tasks data/validation.jsonl \
+  --output-dir runs/base-validation-cpu
+python -m jev_reward_model.train --config configs/grounded_cpu.yaml \
+  --seed 0 --model-revision "$QWEN_REVISION" \
+  --output-dir runs/grounded-cpu/seed-0
+```
+
+`configs/grounded_cpu.yaml` is the example full-run CPU config (`device: cpu`, `dtype: float32`). Any other arm can be run on CPU by adding the same two keys (or omitting `dtype`, which then defaults to `float32` when `device` is `cpu`). Explicit `dtype: bfloat16` with `device: cpu` is rejected. CUDA configs are unchanged.
+
+**Reward-arm limits on CPU:** `grounded` needs only the actor device. `jev_terminal` / `jev_shaping` work with a CPU actor plus the remote Jev HTTP API (`TYPESAFE_API_KEY`). `qwen_judge` / `qwen_shaping` still need a **separate frozen Qwen judge server** (vLLM or equivalent) — the actor being on CPU does not serve that judge, and this harness does not load a second in-process Qwen as a judge.
 
 ### Jev
 
@@ -167,7 +186,7 @@ Set `actor_gpu_usd_per_hour` and `qwen_judge_gpu_usd_per_hour` in **all matched 
 | Module | Responsibility |
 |---|---|
 | `env.py`, `data.py` | Deterministic simulator, hidden labels, disjoint datasets |
-| `policy.py`, `preflight.py` | Actual Qwen loading, language-only LoRA, generation/likelihood/critic |
+| `policy.py`, `preflight.py` | Actual Qwen loading, language-only LoRA, generation/likelihood/critic (CUDA or CPU) |
 | `ppo.py`, `rollout.py` | Complete episodes, GAE, command-level clipped PPO, gradient accumulation |
 | `judge.py`, `jev.py`, `rewards.py` | Shared rubric, validated HTTP/cache/audit, five reward conditions |
 | `train.py`, `evaluate.py` | Training/checkpoints and independent evaluation |

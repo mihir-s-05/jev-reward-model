@@ -9,6 +9,26 @@ import yaml
 ARMS = ("grounded", "jev_terminal", "jev_shaping", "qwen_judge", "qwen_shaping")
 
 
+def normalize_device(value: str) -> str:
+    """Accept cpu / cpu:0 / cuda / cuda:<index>; store a canonical torch device string."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("device must be a non-empty string")
+    text = value.strip()
+    lowered = text.lower()
+    if lowered == "cpu" or lowered.startswith("cpu:"):
+        if lowered != "cpu" and lowered.split(":", 1)[1] != "0":
+            raise ValueError("CPU device must be 'cpu' or 'cpu:0'")
+        return "cpu"
+    if lowered == "cuda" or lowered.startswith("cuda:"):
+        if lowered == "cuda":
+            return "cuda:0"
+        suffix = lowered.split(":", 1)[1]
+        if not suffix.isdigit():
+            raise ValueError("CUDA device must be cuda:<nonnegative integer>")
+        return f"cuda:{int(suffix)}"
+    raise ValueError("device must be cpu or cuda[:index]")
+
+
 @dataclass
 class ExperimentConfig:
     reward: str = "grounded"
@@ -62,13 +82,19 @@ class ExperimentConfig:
     eval_tasks: int = 32
     checkpoint_every: int = 10
 
+    def __post_init__(self) -> None:
+        self.device = normalize_device(self.device)
+
     def validate(self) -> None:
+        self.device = normalize_device(self.device)
         if self.reward not in ARMS:
             raise ValueError(f"reward must be one of {ARMS}")
         if self.judge_view not in {"full", "recent", "ledger"}:
             raise ValueError("judge_view must be full, recent, or ledger")
         if self.dtype not in {"float32", "bfloat16"}:
             raise ValueError("Only float32 and bfloat16 are supported (no fp16 scaler).")
+        if self.device == "cpu" and self.dtype != "float32":
+            raise ValueError("CPU runs require dtype=float32; bfloat16 is not supported on CPU")
         for key in ("updates", "rollouts_per_update", "generation_batch_size", "max_new_tokens",
                     "max_context_tokens", "ppo_epochs", "minibatch_size", "lora_r", "lora_alpha",
                     "recent_events", "judge_workers", "judge_attempts", "max_judge_bytes",
@@ -98,7 +124,11 @@ class ExperimentConfig:
         unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown config keys (old configs are not compatible): {unknown}")
-        cfg = cls(**raw)
+        data = dict(raw)
+        device = normalize_device(data["device"]) if "device" in data else normalize_device(cls.device)
+        if "dtype" not in data and device == "cpu":
+            data["dtype"] = "float32"
+        cfg = cls(**data)
         cfg.validate()
         return cfg
 

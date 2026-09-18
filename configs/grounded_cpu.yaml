@@ -1,0 +1,23 @@
+# Full actor run on CPU: same pipeline as the CUDA configs (preflight, rollouts, PPO,
+# eval, resume). Wall-clock is much slower; this is not a reduced/smoke protocol.
+# Qwen-judge arms still need a separate frozen judge server (vLLM or equivalent).
+reward: grounded
+device: cpu
+dtype: float32
+output_dir: runs/grounded-cpu/seed-0
+seed: 0
+model: Qwen/Qwen3.5-4B
+model_revision: main  # Prefer --model-revision <commit>; sweep resolves this once.
+train_data: data/train.jsonl
+eval_data: data/validation.jsonl
+updates: 100
+rollouts_per_update: 8
+generation_batch_size: 2
+max_new_tokens: 48
+gamma: 1.0
+gae_lambda: 0.95
+shaping_alpha: 0.5
+judge_view: full
+qwen_judge_revision: UNPINNED  # Set to your frozen server's exact checkpoint revision.
+actor_gpu_usd_per_hour: null  # Leave null unless you price the CPU machine as reserved time.
+qwen_judge_gpu_usd_per_hour: null

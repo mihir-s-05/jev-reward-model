@@ -1,8 +1,14 @@
+import random
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 import torch
+from torch import nn
 
 from jev_reward_model.config import ExperimentConfig
-from jev_reward_model.ppo import Turn, add_gae, clipped_loss
+from jev_reward_model.policy import Actor
+from jev_reward_model.ppo import Turn, add_gae, clipped_loss, update
 
 
 def test_gae_lambda_one_matches_monte_carlo():
@@ -27,10 +33,6 @@ def test_ppo_joint_logprob_ratio_and_clipping():
 
 def test_response_alignment_temperature_and_prefix_only_value():
     """Tiny causal stand-in: checks the production scoring path without HF weights."""
-    from types import SimpleNamespace
-    from torch import nn
-    from jev_reward_model.policy import Actor
-
     class Backbone(nn.Module):
         def __init__(self):
             super().__init__()
@@ -56,3 +58,45 @@ def test_response_alignment_temperature_and_prefix_only_value():
     assert lp.item() != changed_lp.item()
     (-lp + value.square()).sum().backward()
     assert core.model.embed.weight.grad is not None
+
+
+def test_ppo_optimizer_step_runs_on_cpu():
+    """Command-level PPO update on CPU using the production update() path."""
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(9, 4)
+
+        def forward(self, input_ids, **kwargs):
+            return SimpleNamespace(last_hidden_state=self.embed(input_ids).cumsum(dim=1))
+
+    class Bundle(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = nn.Linear(4, 9, bias=False)
+
+        def get_base_model(self):
+            return self
+
+        def disable_adapter(self):
+            return nullcontext()
+
+    torch.manual_seed(0)
+    actor = Actor.__new__(Actor)
+    actor.cfg = ExperimentConfig(device="cpu", dtype="float32", temperature=1.0,
+                                 clip_range=0.2, value_clip=0.2, value_coef=0.5,
+                                 target_kl=10.0, max_grad_norm=1.0, ppo_epochs=1,
+                                 minibatch_size=2, learning_rate=1e-3, value_learning_rate=1e-3)
+    actor.device = torch.device("cpu")
+    actor.model = Bundle()
+    actor.value_head = nn.Linear(4, 1)
+    prompt, action = torch.tensor([1, 2]), torch.tensor([3, 4])
+    with torch.no_grad():
+        lp, value = actor.score(prompt, action)
+    turns = [Turn(prompt, action, old_logprob=lp.item(), old_value=value.item(), reward=1.0)
+             for _ in range(2)]
+    add_gae(turns, gamma=1.0, lam=1.0)
+    losses = update(actor, turns, actor.optimizer(), actor.cfg, random.Random(0))
+    assert losses["optimizer_steps"] == 1
+    assert torch.isfinite(torch.tensor(losses["policy_loss"]))

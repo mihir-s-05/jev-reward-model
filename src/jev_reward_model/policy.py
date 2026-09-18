@@ -25,18 +25,31 @@ SYSTEM = (
 
 class Actor:
     def __init__(self, cfg: ExperimentConfig, adapter_path: Path | None = None):
-        # GPU dependencies are optional for dataset generation and judge-only audits.
+        # Training-stack imports stay local so dataset generation and judge-only audits
+        # can run without transformers/peft.
         from peft import LoraConfig, PeftModel, get_peft_model
         from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
         self.cfg = cfg
         self.device = torch.device(cfg.device)
-        if self.device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("CUDA is required by this config; CPU is only practical for small tests")
+        if self.device.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA is required by this config "
+                    f"(device={cfg.device}); use a CUDA PyTorch build or set device: cpu with dtype: float32"
+                )
+        elif self.device.type == "cpu":
+            if cfg.dtype != "float32":
+                raise RuntimeError("CPU actor runs require dtype=float32; bfloat16 is not supported on CPU")
+        else:
+            raise RuntimeError(f"Unsupported actor device: {self.device}")
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model, revision=cfg.model_revision)
+        # Pin placement so a CUDA-capable machine still honors an explicit CPU config.
         base = Qwen3_5ForConditionalGeneration.from_pretrained(
             cfg.model, revision=cfg.model_revision, dtype=getattr(torch, cfg.dtype),
             device_map={"": str(self.device)}, attn_implementation="sdpa")
+        if next(base.parameters()).device.type != self.device.type:
+            base = base.to(self.device)
         if not hasattr(base.model, "language_model") or not hasattr(base, "lm_head"):
             raise RuntimeError("Unsupported Qwen3.5 structure; inspect the pinned Transformers version")
         self.resolved_revision = getattr(base.config, "_commit_hash", None)
@@ -49,6 +62,7 @@ class Actor:
                 lora_dropout=0.0, target_modules=targets, task_type="CAUSAL_LM", bias="none"))
         else:
             self.model = PeftModel.from_pretrained(base, str(adapter_path), is_trainable=True)
+        self.model.to(self.device)
         self.value_head = nn.Linear(base.config.text_config.hidden_size, 1).to(self.device)
         nn.init.zeros_(self.value_head.weight)
         nn.init.zeros_(self.value_head.bias)
