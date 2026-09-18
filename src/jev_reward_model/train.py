@@ -93,7 +93,8 @@ def main() -> None:
         task_rng.setstate(state["task_rng"])
         shuffle_rng.setstate(state["shuffle_rng"])
         torch.set_rng_state(state["torch_rng"])
-        if torch.cuda.is_available():
+        if (actor.device.type == "cuda" and torch.cuda.is_available()
+                and state.get("cuda_rng")):
             torch.cuda.set_rng_state_all(state["cuda_rng"])
         counters, first = state["counters"], state["update"]
         elapsed_before, prior_judge = state["elapsed_seconds"], state["judge_totals"]
@@ -102,6 +103,8 @@ def main() -> None:
     write_json(out / "manifest.json", {"config": cfg.to_dict(), **prov,
             "resolved_actor_revision": actor.resolved_revision,
             "lora_trainable_parameters": sum(p.numel() for p in actor.model.parameters() if p.requires_grad),
+            "device": str(actor.device),
+            "dtype": cfg.dtype,
             "gpu": torch.cuda.get_device_name(actor.device) if actor.device.type == "cuda" else None,
             "resumed_from": str(args.resume) if args.resume else None,
             "status": "initialized; no results implied"})
@@ -135,7 +138,8 @@ def main() -> None:
         actor.save(checkpoint_dir)
         torch.save({"config": cfg.to_dict(), "data_sha256": prov["data_sha256"],
                     "optimizer": optimizer.state_dict(), "torch_rng": torch.get_rng_state(),
-                    "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+                    "cuda_rng": (torch.cuda.get_rng_state_all()
+                                 if actor.device.type == "cuda" and torch.cuda.is_available() else []),
                     "task_rng": task_rng.getstate(), "shuffle_rng": shuffle_rng.getstate(),
                     "counters": counters, "update": number, "elapsed_seconds": elapsed(),
                     "judge_totals": judge_totals()}, checkpoint_dir / "training_state.pt")

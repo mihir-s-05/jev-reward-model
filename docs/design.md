@@ -22,7 +22,9 @@ This is command-level PPO, not token-level PPO/GRPO. Longer commands have more s
 
 `Qwen3_5ForConditionalGeneration` loads the real multimodal checkpoint. Only text is supplied; language Linear layers receive LoRA adapters, not the vision stack. The critic is a small scalar head on the final prompt hidden state. That position precedes action tokens; causal processing prevents answer leakage. Actor and critic share the adapted backbone, but Jev is never substituted for the policy-dependent value function.
 
-A single backbone forward yields both action likelihood and the prefix value. The large vocabulary projection is restricted to response positions and checkpointed in small chunks. Generation batches active episodes; PPO accumulates one-command microbatches into a minibatch optimizer step. Rollouts retain unpadded CPU tokens, not GPU graphs. Gradient checkpointing and zero dropout are explicit. No throughput or VRAM claim is made before measurement.
+A single backbone forward yields both action likelihood and the prefix value. The large vocabulary projection is restricted to response positions and checkpointed in small chunks. Generation batches active episodes; PPO accumulates one-command microbatches into a minibatch optimizer step. Rollouts retain unpadded CPU token ids; compute runs on the configured actor device. Gradient checkpointing and zero dropout are explicit. No throughput or VRAM claim is made before measurement.
+
+Default experiments use `device: cuda:0` and `dtype: bfloat16`. CPU is a supported full actor path with `device: cpu` and `dtype: float32` (bfloat16 is rejected on CPU). Generate, score, GAE/PPO, gradient checkpointing, checkpoint save/load, evaluate, and preflight share that device. This is correctness/parity of the training loop, not wall-clock parity. Frozen Qwen-judge arms still require a separate serving stack; Jev arms may use a CPU actor with the remote API.
 
 Complete finite-task episodes supply GAE:
 
@@ -75,7 +77,7 @@ The reporting script aligns only **already completed** validation checkpoints at
 
 | Run artifact | Contents |
 |---|---|
-| `resolved_config.yaml`, `manifest.json` | Full settings, actor revision, source/data fingerprints, packages, GPU |
+| `resolved_config.yaml`, `manifest.json` | Full settings, actor revision, source/data fingerprints, packages, device/dtype, GPU name when CUDA |
 | `rollouts.jsonl` | Exact sampled prompt/action tokens, old likelihoods/values, raw evidence, before API calls |
 | `train_traces.jsonl` | Rewards, potentials, terminal judge scores, grounded outcomes, complete history |
 | `train.jsonl` | PPO metrics, success, separate task/objective returns, cumulative counters and times |
@@ -88,7 +90,7 @@ No API credentials are put into configs or request logs. Trace files can be larg
 
 Billed token counters count successful uncached validated requests; replay counters include cache reuse across calls. In-batch deduplication is one evaluation, not multiple billed requests. Concurrent summed request-seconds are not wall time: `reward_seconds` measures the actual evaluator phase. Failed/retried calls can have unknown billing; accounting flags that uncertainty, and failed raw response bodies are retained for review.
 
-User-supplied hourly rates yield reserved-device estimates including model load, actor work, evaluator waits, and validation. They do not include separately performed offline audits, server initialization before the run, storage, or idle gaps between processes. Charge those separately in a complete study invoice. CUDA synchronization brackets GPU phases. Exact bitwise reproducibility across kernels/hardware or changing hosted models is not promised.
+User-supplied hourly rates yield reserved-device estimates including model load, actor work, evaluator waits, and validation. They do not include separately performed offline audits, server initialization before the run, storage, or idle gaps between processes. Charge those separately in a complete study invoice. CUDA synchronization brackets GPU phases; CPU phases have nothing to synchronize. Exact bitwise reproducibility across kernels/hardware or changing hosted models is not promised.
 
 ## Sources checked for this implementation
 
