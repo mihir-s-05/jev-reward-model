@@ -23,6 +23,19 @@ SYSTEM = (
 )
 
 
+def prompt_token_ids(encoded) -> torch.Tensor:
+    # Transformers 5 BatchEncoding[0] is tokenizers.Encoding, not a row tensor.
+    if torch.is_tensor(encoded):
+        ids = encoded
+    elif hasattr(encoded, "input_ids"):
+        ids = encoded.input_ids
+    else:
+        ids = encoded["input_ids"]
+    if not torch.is_tensor(ids):
+        ids = torch.as_tensor(ids, dtype=torch.long)
+    return ids[0] if ids.ndim == 2 else ids
+
+
 class Actor:
     def __init__(self, cfg: ExperimentConfig, adapter_path: Path | None = None):
         # Training-stack imports stay local so dataset generation and judge-only audits
@@ -86,8 +99,9 @@ class Actor:
     def prompt(self, state: dict) -> torch.Tensor:
         messages = [{"role": "system", "content": SYSTEM},
                     {"role": "user", "content": canonical(state)}]
-        ids = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
-                                                 enable_thinking=False, return_tensors="pt")[0]
+        encoded = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True,
+                                                     enable_thinking=False, return_tensors="pt")
+        ids = prompt_token_ids(encoded)
         if ids.numel() + self.cfg.max_new_tokens > self.cfg.max_context_tokens:
             raise ValueError("Actor context budget exceeded; no silent left truncation is permitted")
         return ids.cpu()

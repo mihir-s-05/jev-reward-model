@@ -14,7 +14,7 @@ from torch import nn
 
 from jev_reward_model.config import ExperimentConfig
 from jev_reward_model.data import make_task
-from jev_reward_model.policy import Actor
+from jev_reward_model.policy import Actor, prompt_token_ids
 from jev_reward_model.ppo import add_gae, update
 from jev_reward_model.preflight import inspect_actor
 from jev_reward_model.rewards import assign_rewards
@@ -96,6 +96,31 @@ class FakeQwen(nn.Module):
         (Path(directory) / "adapter_marker.txt").write_text("ok")
 
 
+class TokenizersEncoding:
+    """tokenizers.Encoding stand-in: integer indexing works, numel does not."""
+
+    def __init__(self, ids):
+        self.ids = list(ids)
+
+    def __len__(self):
+        return len(self.ids)
+
+
+class FakeBatchEncoding(dict):
+    """transformers 5 BatchEncoding stand-in for apply_chat_template(..., return_tensors='pt')."""
+
+    def __init__(self, input_ids):
+        super().__init__(input_ids=input_ids)
+        self.input_ids = input_ids
+        row = input_ids[0] if getattr(input_ids, "ndim", 1) == 2 else input_ids
+        self._encodings = [TokenizersEncoding(row.tolist())]
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            return self._encodings[item]
+        return super().__getitem__(item)
+
+
 class FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 1
@@ -108,7 +133,7 @@ class FakeTokenizer:
         return cls()
 
     def apply_chat_template(self, messages, **kwargs):
-        return torch.tensor([[2, 3, 4]])
+        return FakeBatchEncoding(torch.tensor([[2, 3, 4]]))
 
     def decode(self, ids, skip_special_tokens=True):
         return "WAIT"
@@ -161,6 +186,8 @@ def test_actor_accepts_cpu_float32_and_stays_on_cpu(monkeypatch, tmp_path):
     assert actor.value_head.weight.dtype == torch.float32
     prompt = actor.prompt({"x": 1})
     assert prompt.device.type == "cpu"
+    assert prompt.ndim == 1
+    assert torch.equal(prompt, torch.tensor([2, 3, 4]))
     actions = actor.generate([prompt])
     assert actions and actions[0].device.type == "cpu"
     lp, value = actor.score(prompt, actions[0])
@@ -205,6 +232,44 @@ def test_cpu_collect_ppo_eval_and_preflight(monkeypatch):
     assert result["device"] == "cpu"
     assert result["dtype"] == "float32"
     assert result["status"].startswith("Actor preflight passed")
+
+
+def test_prompt_token_ids_rejects_batch_encoding_integer_index():
+    encoded = FakeBatchEncoding(torch.tensor([[9, 8, 7]]))
+    with pytest.raises(AttributeError):
+        encoded[0].numel()
+    ids = prompt_token_ids(encoded)
+    assert ids.ndim == 1
+    assert torch.equal(ids, torch.tensor([9, 8, 7]))
+
+
+@pytest.mark.parametrize("encoded", [
+    torch.tensor([[2, 3, 4]]),
+    torch.tensor([2, 3, 4]),
+    FakeBatchEncoding(torch.tensor([[2, 3, 4]])),
+    {"input_ids": torch.tensor([[2, 3, 4]])},
+    {"input_ids": [[2, 3, 4]]},
+])
+def test_prompt_token_ids_normalizes_tensor_and_batch_encoding(encoded):
+    ids = prompt_token_ids(encoded)
+    assert ids.ndim == 1
+    assert torch.equal(ids, torch.tensor([2, 3, 4]))
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: torch.tensor([[2, 3, 4]]),
+    lambda: torch.tensor([2, 3, 4]),
+    lambda: FakeBatchEncoding(torch.tensor([[2, 3, 4]])),
+    lambda: {"input_ids": torch.tensor([[2, 3, 4]])},
+])
+def test_actor_prompt_accepts_chat_template_return_shapes(monkeypatch, factory):
+    install_fake_hf(monkeypatch)
+    monkeypatch.setattr(FakeTokenizer, "apply_chat_template",
+                        lambda self, messages, **kwargs: factory())
+    prompt = Actor(cpu_cfg()).prompt({"x": 1})
+    assert prompt.ndim == 1
+    assert prompt.device.type == "cpu"
+    assert torch.equal(prompt, torch.tensor([2, 3, 4]))
 
 
 @pytest.mark.skipif(not os.environ.get("JEV_CPU_INTEGRATION"),
